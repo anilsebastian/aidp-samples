@@ -93,17 +93,34 @@ FETCH FIRST 20 ROWS ONLY'''
         if not rows:
             return {"messages": [{"role": "ai", "content": "✅ No maverick spend detected. All transactions have contracts and matched suppliers."}]}
         
+        # Calculate summary stats
         total_maverick = sum(float(r.get("LINE_AMOUNT_USD", 0) or 0) for r in rows)
-        no_contract_count = sum(1 for r in rows if "No Contract" in str(r.get("RISK_TYPE", "")))
+        no_contract_rows = [r for r in rows if "No Contract" in str(r.get("RISK_TYPE", ""))]
+        no_contract_total = sum(float(r.get("LINE_AMOUNT_USD", 0) or 0) for r in no_contract_rows)
         unmatched_count = sum(1 for r in rows if "Unmatched" in str(r.get("RISK_TYPE", "")))
         low_conf_count = sum(1 for r in rows if "Low Confidence" in str(r.get("RISK_TYPE", "")))
+        
+        # Find top offender
+        top_supplier = rows[0].get("SUPPLIER_NAME", "Unknown") if rows else "Unknown"
+        top_amount = float(rows[0].get("LINE_AMOUNT_USD", 0) or 0) if rows else 0
+        
+        # Find repeat offenders
+        supplier_counts = {}
+        supplier_totals = {}
+        for r in rows:
+            sup = r.get("SUPPLIER_NAME", "Unknown")
+            amt = float(r.get("LINE_AMOUNT_USD", 0) or 0)
+            supplier_counts[sup] = supplier_counts.get(sup, 0) + 1
+            supplier_totals[sup] = supplier_totals.get(sup, 0) + amt
+        repeat_offenders = [(s, supplier_counts[s], supplier_totals[s]) for s in supplier_counts if supplier_counts[s] > 1]
+        repeat_offenders.sort(key=lambda x: x[2], reverse=True)
         
         lines = []
         lines.append("🚨 **Maverick Spend Analysis**\n")
         lines.append(f"**Total Flagged:** {format_currency(total_maverick)} across {len(rows)} transactions\n")
         lines.append("**Breakdown:**")
-        if no_contract_count > 0:
-            lines.append(f"  🟠 No Contract: {no_contract_count} transactions")
+        if no_contract_rows:
+            lines.append(f"  🟠 No Contract: {len(no_contract_rows)} transactions ({format_currency(no_contract_total)})")
         if unmatched_count > 0:
             lines.append(f"  🟠 Unmatched Supplier: {unmatched_count} transactions")
         if low_conf_count > 0:
@@ -124,7 +141,18 @@ FETCH FIRST 20 ROWS ONLY'''
         if len(rows) > 15:
             lines.append(f"\n*Showing top 15 of {len(rows)} flagged transactions*")
         
-        lines.append("\n**Recommendation:** Review no-contract purchases for compliance and negotiate master agreements with frequently used suppliers.")
+        # Smart recommendations
+        lines.append("\n---\n**🎯 Recommended Actions:**\n")
+        lines.append(f"**1. Immediate:** Review {top_supplier} ({format_currency(top_amount)}) — your largest flagged purchase. Determine if this should be under a master agreement.")
+        
+        if repeat_offenders:
+            top_repeat = repeat_offenders[0]
+            lines.append(f"\n**2. Quick Win:** {top_repeat[0]} has {top_repeat[1]} flagged transactions totaling {format_currency(top_repeat[2])}. Negotiate a blanket contract.")
+        
+        if no_contract_total > 100000:
+            lines.append(f"\n**3. Process Fix:** {format_currency(no_contract_total)} in no-contract spend. Consider requiring contract reference for POs over $10K.")
+        
+        lines.append(f"\n**Next:** Run `supplier risk` to check if these suppliers represent concentration risk.")
         
         return {"messages": [{"role": "ai", "content": "\n".join(lines)}]}
     except Exception as e:
@@ -166,6 +194,13 @@ FETCH FIRST 15 ROWS ONLY'''
         total_leakage = sum(float(r.get("TOTAL_SPEND", 0) or 0) for r in rows)
         max_spend = max(float(r.get("TOTAL_SPEND", 0) or 0) for r in rows) if rows else 0
         
+        # Find top opportunities
+        top3 = rows[:3]
+        top3_spend = sum(float(r.get("TOTAL_SPEND", 0) or 0) for r in top3)
+        
+        # Find 3+ system suppliers (highest priority)
+        multi_system = [r for r in rows if int(r.get("NUM_SYSTEMS", 0) or 0) >= 3]
+        
         lines = []
         lines.append("💰 **Spend Consolidation Opportunities**\n")
         lines.append(f"**Total Addressable Spend:** {format_currency(total_leakage)} across {len(rows)} suppliers\n")
@@ -185,8 +220,30 @@ FETCH FIRST 15 ROWS ONLY'''
         
         lines.append("")
         lines.append("**Legend:** 🔴 3+ systems (high priority) | 🟡 2 systems")
-        lines.append("")
-        lines.append("**Recommendation:** Consolidate these suppliers under single enterprise contracts to improve negotiating leverage and reduce procurement overhead.")
+        
+        # Smart recommendations
+        lines.append("\n---\n**🎯 Recommended Actions:**\n")
+        
+        if rows:
+            top = rows[0]
+            top_name = top.get("CANONICAL_SUPPLIER_NAME", "Unknown")
+            top_spend = float(top.get("TOTAL_SPEND", 0) or 0)
+            top_systems = top.get("SYSTEMS", "")
+            est_savings = top_spend * 0.08
+            lines.append(f"**1. Biggest Opportunity:** {top_name} ({format_currency(top_spend)} across {top_systems})")
+            lines.append(f"   → Consolidate under single contract. Est. savings: {format_currency(est_savings)} (8% volume discount)")
+        
+        if multi_system:
+            lines.append(f"\n**2. High Complexity:** {len(multi_system)} suppliers span 3+ systems:")
+            for r in multi_system[:3]:
+                lines.append(f"   • {r.get('CANONICAL_SUPPLIER_NAME', 'Unknown')}: {r.get('SYSTEMS', '')}")
+        
+        if len(rows) >= 3:
+            lines.append(f"\n**3. Quick Win:** Top 3 suppliers = {format_currency(top3_spend)} ({top3_spend/total_leakage*100:.0f}% of leakage)")
+        
+        total_est_savings = total_leakage * 0.05
+        lines.append(f"\n**💵 Total Savings Potential:** {format_currency(total_est_savings)} (5% through consolidation)")
+        lines.append(f"\n**Next:** Run `savings opportunities` to find price variances for these suppliers.")
         
         return {"messages": [{"role": "ai", "content": "\n".join(lines)}]}
     except Exception as e:
@@ -327,8 +384,33 @@ FETCH FIRST 15 ROWS ONLY'''
             
             lines.append(f"| {supplier} | {category} | {num_bus} | {format_currency(min_price)} | {format_currency(max_price)} | {var_display} |")
         
-        lines.append("")
-        lines.append("**Recommendation:** Negotiate standardized pricing with high-variance suppliers. Start with largest variance × volume combinations.")
+        # Smart recommendations
+        lines.append("\n---\n**🎯 Recommended Actions:**\n")
+        
+        # Get top opportunity details
+        if rows:
+            top_row = rows[0]
+            top_supplier = top_row.get("CANONICAL_SUPPLIER_NAME", "Unknown")
+            top_category = top_row.get("CATEGORY_NAME", "Unknown")
+            top_variance = float(top_row.get("VARIANCE_PCT", 0) or 0)
+            top_min = float(top_row.get("MIN_PRICE", 0) or 0)
+            top_max = float(top_row.get("MAX_PRICE", 0) or 0)
+            
+            lines.append(f"**1. Start Here:** {top_supplier} / {top_category}")
+            lines.append(f"   → Price ranges from {format_currency(top_min)} to {format_currency(top_max)} ({top_variance:.0f}% variance)")
+            lines.append(f"   → Action: Negotiate standardized pricing at {format_currency((top_min + top_max) / 2)} or lower")
+        
+        # Find highest variance
+        if len(rows) > 1:
+            highest_var_row = max(rows, key=lambda r: float(r.get("VARIANCE_PCT", 0) or 0))
+            highest_var = float(highest_var_row.get("VARIANCE_PCT", 0) or 0)
+            highest_var_supplier = highest_var_row.get("CANONICAL_SUPPLIER_NAME", "Unknown")
+            if highest_var_supplier != top_supplier and highest_var > 100:
+                lines.append(f"\n**2. Biggest Variance:** {highest_var_supplier} has {highest_var:.0f}% price variance — suggests ad-hoc purchasing")
+        
+        lines.append(f"\n**3. Process Fix:** Implement standard pricing sheets for top suppliers. Flag POs exceeding catalog price by >10%.")
+        lines.append(f"\n**💵 Bottom Line:** Standardizing prices could save {format_currency(est_savings)} annually.")
+        lines.append(f"\n**Next:** Run `spend leakage` to see if these suppliers are also fragmented across systems.")
         
         return {"messages": [{"role": "ai", "content": "\n".join(lines)}]}
     except Exception as e:
@@ -417,12 +499,32 @@ FETCH FIRST 10 ROWS ONLY'''
         else:
             lines.append("✅ **Concentration:** No suppliers exceed 5% of total spend.\n")
         
-        lines.append("**Recommendations:**")
+        # Smart recommendations
+        lines.append("---\n**🎯 Recommended Actions:**\n")
+        
         if concentration_rows:
-            lines.append("• Develop alternate suppliers for single-source categories")
+            top_single = concentration_rows[0]
+            top_cat = top_single.get("CATEGORY_NAME", "Unknown")
+            top_sup = top_single.get("PRIMARY_SUPPLIER", "Unknown")
+            top_spend = float(top_single.get("TOTAL_SPEND", 0) or 0)
+            lines.append(f"**1. Critical Risk:** {top_cat} depends entirely on {top_sup} ({format_currency(top_spend)})")
+            lines.append(f"   → Action: Identify 1-2 alternate suppliers within 30 days")
+            lines.append(f"   → Interim: Review contract for early termination risk")
+        
         if reliance_rows:
-            lines.append("• Review contracts for top suppliers — ensure favorable terms given volume")
-        lines.append("• Consider strategic sourcing initiative for high-concentration areas")
+            top_rel = reliance_rows[0]
+            top_name = top_rel.get("CANONICAL_SUPPLIER_NAME", "Unknown")
+            top_spend = float(top_rel.get("SUPPLIER_SPEND", 0) or 0)
+            top_pct = float(top_rel.get("PCT_OF_TOTAL", 0) or 0)
+            lines.append(f"\n**2. Leverage Opportunity:** {top_name} = {top_pct:.1f}% of spend ({format_currency(top_spend)})")
+            lines.append(f"   → Action: Schedule QBR to negotiate better terms (volume discount, payment terms)")
+            lines.append(f"   → Your volume justifies preferred pricing tier")
+        
+        if concentration_rows and len(concentration_rows) >= 3:
+            lines.append(f"\n**3. Diversification:** {len(concentration_rows)} single-source categories need backup suppliers")
+            lines.append(f"   → Target: No category >$500K should be single-source")
+        
+        lines.append(f"\n**Next:** Run `maverick spend` to check if high-risk suppliers also have contract gaps.")
         
         return {"messages": [{"role": "ai", "content": "\n".join(lines)}]}
     except Exception as e:
