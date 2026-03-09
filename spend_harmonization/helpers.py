@@ -83,7 +83,7 @@ def risk_emoji(risk_type: str) -> str:
 
 
 def extract_rows_from_result(result: Any) -> List[dict]:
-    """Extract rows from SQLTool result."""
+    """Extract rows from SQLTool result, normalizing column names to uppercase."""
     if result is None:
         return []
     if isinstance(result, dict):
@@ -94,7 +94,14 @@ def extract_rows_from_result(result: Any) -> List[dict]:
             payload = payload["structuredContent"]
         rows = payload.get("rows", [])
         if isinstance(rows, list):
-            return rows
+            # Normalize all column names to uppercase for consistent access
+            normalized_rows = []
+            for row in rows:
+                if isinstance(row, dict):
+                    normalized_rows.append({k.upper(): v for k, v in row.items()})
+                else:
+                    normalized_rows.append(row)
+            return normalized_rows
     return []
 
 
