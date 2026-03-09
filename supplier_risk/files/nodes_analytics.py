@@ -1,18 +1,6 @@
 # ============================================================
 # nodes_analytics.py — All 7 Analytics Commands
 # ============================================================
-# Confirmed patterns from connectivity test:
-#
-# SQL: make_sql_tool(name, desc, query) → tool.ainvoke({})
-#      result shape: result["result"]["structuredContent"]["rows"]
-#      extract with: extract_rows_from_result(result)
-#
-# RAG: make_rag_tool(name, desc) → tool.ainvoke({"query": "..."})
-#      result shape: result["result"]["structuredContent"]["answer"]
-#      extract with: extract_rag_answer(result)
-#
-# Messages: {"role": "ai", "content": msg}  ← plain dict, not AIMessage
-
 import traceback
 from langgraph.graph import MessagesState
 from config import CATALOG_KEY, SCHEMA_KEY, SUPPLIER_MASTER_TABLE, SPEND_HISTORY_TABLE, PO_PIPELINE_TABLE
@@ -20,22 +8,80 @@ from sql_tools import make_sql_tool
 from rag_tools import make_rag_tool
 from helpers import (
     extract_text_from_last_message, extract_rows_from_result, extract_rag_answer,
-    format_currency, risk_color, delivery_color, make_bar
+    format_currency, risk_color, delivery_color
 )
 
+# Known suppliers and categories for fast matching
+KNOWN_SUPPLIERS = [
+    "acme", "vertex", "sunrise", "blueridge", "coastal",
+    "novatech", "silkroad", "apex", "prism", "delta"
+]
+KNOWN_CATEGORIES = ["electronics", "logistics", "packaging", "raw material", "raw materials"]
 
-def _entity(state, strip_words):
-    """Extract entity name from user message by stripping command keywords."""
-    text = extract_text_from_last_message(state).lower().strip()
-    for w in strip_words:
-        text = text.replace(w, "").strip()
-    return text.strip()
+
+def _extract_supplier(text: str) -> str:
+    """Fast keyword match for known supplier names."""
+    t = text.lower()
+    for s in KNOWN_SUPPLIERS:
+        if s in t:
+            return s
+    return ""
+
+
+def _extract_category(text: str) -> str:
+    """Fast keyword match for known category names."""
+    t = text.lower()
+    for c in KNOWN_CATEGORIES:
+        if c in t:
+            return c
+    return ""
+
+
+async def _llm_extract(user_message: str, extract_type: str) -> str:
+    """LLM fallback to extract supplier name or category from natural language."""
+    try:
+        from llm import ensure_llm
+        from langchain_core.prompts import ChatPromptTemplate
+        from langchain_core.output_parsers import StrOutputParser
+
+        known = KNOWN_SUPPLIERS if extract_type == "supplier" else KNOWN_CATEGORIES
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", f"""Extract the {extract_type} name from the user message.
+Known {extract_type}s: {', '.join(known)}
+Return ONLY the {extract_type} name in lowercase (e.g. 'acme' or 'electronics').
+If no specific {extract_type} is mentioned return the word: none"""),
+            ("user", "{message}")
+        ])
+        llm    = ensure_llm()
+        result = await (prompt | llm | StrOutputParser()).ainvoke({"message": user_message})
+        result = result.strip().lower()
+        return "" if result == "none" else result
+    except Exception:
+        return ""
+
+
+async def _get_supplier(state) -> str:
+    """Get supplier entity — fast match first, LLM fallback."""
+    text   = extract_text_from_last_message(state)
+    entity = _extract_supplier(text)
+    if not entity:
+        entity = await _llm_extract(text, "supplier")
+    return entity
+
+
+async def _get_category(state) -> str:
+    """Get category entity — fast match first, LLM fallback."""
+    text   = extract_text_from_last_message(state)
+    entity = _extract_category(text)
+    if not entity:
+        entity = await _llm_extract(text, "category")
+    return entity
 
 
 # ── Node 1: Supplier Risk Profile (SQL + RAG) ──────────────────────────────
 
 async def supplier_risk_profile_node(state: MessagesState):
-    entity = _entity(state, ["supplier risk profile", "risk profile"])
+    entity = await _get_supplier(state)
     if not entity:
         return {"messages": [{"role": "ai", "content": "Please specify a supplier name. Example: `supplier risk profile acme`"}]}
     try:
@@ -185,7 +231,7 @@ async def open_po_exposure_node(state: MessagesState):
 # ── Node 4: Delivery Performance (SQL only) ───────────────────────────────
 
 async def delivery_performance_node(state: MessagesState):
-    entity = _entity(state, ["delivery performance", "delivery trend", "delivery"])
+    entity = await _get_supplier(state)
     if not entity:
         return {"messages": [{"role": "ai", "content": "Please specify a supplier name. Example: `delivery performance acme`"}]}
     try:
@@ -231,7 +277,7 @@ async def delivery_performance_node(state: MessagesState):
 # ── Node 5: Supplier News Alerts (RAG only) ───────────────────────────────
 
 async def supplier_news_alerts_node(state: MessagesState):
-    entity = _entity(state, ["supplier news alerts", "news alerts", "news", "alerts"])
+    entity = await _get_supplier(state)
     try:
         query      = f"risk alerts news financial operational geopolitical compliance {entity}" if entity else "supplier risk alerts news"
         rag_answer = extract_rag_answer(await make_rag_tool("news_alerts", "supplier news").ainvoke({"query": query}))
@@ -254,7 +300,7 @@ async def esg_compliance_node(state: MessagesState):
 # ── Node 7: Category Risk Briefing (SQL + RAG) ────────────────────────────
 
 async def category_risk_briefing_node(state: MessagesState):
-    entity = _entity(state, ["category risk briefing", "category risk", "category briefing", "category"])
+    entity = await _get_category(state)
     if not entity:
         return {"messages": [{"role": "ai", "content": "Please specify a category. Example: `category risk briefing electronics`"}]}
     try:
