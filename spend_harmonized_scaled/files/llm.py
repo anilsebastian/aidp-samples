@@ -1,108 +1,194 @@
 # ============================================================
-# llm.py — LLM initialization and intent understanding
+# nodes_nlp.py — Natural language intent understanding node
 # ============================================================
-import json
-import re
-from typing import List
-
-from langchain_core.prompts import ChatPromptTemplate
+import traceback
 from langchain_core.output_parsers import StrOutputParser
+from langgraph.graph import MessagesState
 
-from config import (
-    REGION, MODEL_ID, MODEL_PROVIDER, OCI_COMPARTMENT_ID,
-    LLM_TEMPERATURE, LLM_MAX_TOKENS
+from llm import (
+    LLM_AVAILABLE, 
+    ensure_llm, 
+    SPEND_INTENT_PROMPT, 
+    TEXT_TO_SQL_PROMPT,
+    parse_intent_response,
+    clean_sql_response
 )
-
-# ============================================================
-# Import tracking
-# ============================================================
-IMPORT_ERRORS: List[str] = []
-LLM_AVAILABLE = True
-
-try:
-    from aidputils.agents.toolkit.agent_helper import init_oci_llm, pre_invoke_setup
-    from aidputils.agents.toolkit.configs import OCIAIConf
-except Exception as e:
-    LLM_AVAILABLE = False
-    IMPORT_ERRORS.append(f"LLM imports failed: {e!r}")
-
-# Module-level LLM instance (lazy init)
-_llm_instance = None
-
-
-def ensure_llm():
-    """Lazy-init the LLM instance."""
-    global _llm_instance
-    if not LLM_AVAILABLE:
-        raise RuntimeError("LLM not available. Check imports.")
-    pre_invoke_setup()
-    if _llm_instance is None:
-        oci_conf = OCIAIConf(
-            model_provider=MODEL_PROVIDER,
-            compartment_id=OCI_COMPARTMENT_ID,
-            model_id=MODEL_ID,
-            endpoint=f"https://inference.generativeai.{REGION}.oci.oraclecloud.com",
-            model_args={
-                "temperature": LLM_TEMPERATURE,
-                "max_tokens": LLM_MAX_TOKENS,
-            }
-        )
-        _llm_instance = init_oci_llm(oci_conf)
-        print("LLM initialized")
-    return _llm_instance
+from nodes_core import extract_text_from_last_message, help_node
+from nodes_analytics import (
+    top_suppliers_node,
+    maverick_spend_node,
+    spend_leakage_node,
+    spend_by_category_node,
+    savings_opportunities_node,
+    supplier_risk_node,
+    spend_trend_node,
+)
+from nodes_core import sample_spend_node
+from sql_tools import make_sql_tool
+from helpers import extract_rows_from_result, format_currency
 
 
 # ============================================================
-# Intent Understanding Prompt
+# Data Question Node (Text-to-SQL)
 # ============================================================
-SPEND_INTENT_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are the orchestration brain for a Spend Optimization Agent.
-Your job is to understand what the user is asking about their procurement spend data and route to the right analysis.
-
-Available analyses:
-- top_suppliers: Show top suppliers by spend amount
-- maverick_spend: Find purchases without contracts or unmatched suppliers
-- spend_leakage: Find suppliers used across multiple ERP systems (consolidation opportunities)
-- spend_by_category: Breakdown spend by category with off-contract percentages
-- savings_opportunities: Find price variances for same supplier across business units
-- supplier_risk: Analyze concentration risk and single-source categories
-- spend_trend: Show spend trends over time by month
-- sample_data: Show sample raw data
-- help: Show available commands
-
-Output STRICT JSON only (no markdown, no extra text) with this schema:
-{{"intent": "<one of the analyses above>", "explanation": "Brief explanation of why this analysis answers their question", "follow_up": "Optional follow-up question to ask user, or empty string"}}
-
-Examples:
-- "Who are my biggest vendors?" -> {{"intent": "top_suppliers", "explanation": "Showing your highest-spend suppliers", "follow_up": ""}}
-- "Where am I at risk?" -> {{"intent": "supplier_risk", "explanation": "Analyzing supplier concentration and single-source risks", "follow_up": ""}}
-- "Show me spend without contracts" -> {{"intent": "maverick_spend", "explanation": "Finding purchases that lack contract coverage", "follow_up": ""}}
-- "Where can I save money?" -> {{"intent": "savings_opportunities", "explanation": "Looking for price variances where you pay different rates for same supplier", "follow_up": ""}}
-- "How is my spend trending?" -> {{"intent": "spend_trend", "explanation": "Showing monthly spend patterns over time", "follow_up": ""}}
-- "What should I consolidate?" -> {{"intent": "spend_leakage", "explanation": "Finding suppliers used across multiple systems that could be consolidated", "follow_up": ""}}
-- "Show me category breakdown" -> {{"intent": "spend_by_category", "explanation": "Breaking down spend by category with compliance metrics", "follow_up": ""}}
-
-If the question is ambiguous or you are unsure, pick the most likely intent and explain your reasoning."""),
+async def data_question_node(state: MessagesState):
+    """
+    Handle arbitrary data questions via Text-to-SQL.
     
-    ("user", "{user_message}")
-])
-
-
-def parse_intent_response(raw: str) -> dict:
-    """Parse LLM JSON response, handling markdown code blocks."""
-    text = raw.strip()
-    # Remove markdown code blocks if present
-    if text.startswith("```"):
-        text = re.sub(r"```json?\s*", "", text)
-        text = re.sub(r"```\s*$", "", text)
+    Flow:
+    1. Take user's natural language question
+    2. Send to LLM with schema context to generate SQL
+    3. Execute the SQL
+    4. Format and return results
+    """
+    user_text = extract_text_from_last_message(state)
+    generated_sql = None  # Track for error reporting
+    
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # Fallback: try to extract JSON from response
-        match = re.search(r'\{[^{}]+\}', text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except:
-                pass
-        return {"intent": "help", "explanation": "I couldn't understand that. Here are the available commands.", "follow_up": ""}
+        if not LLM_AVAILABLE:
+            return {"messages": [{"role": "ai", "content": "LLM not available for Text-to-SQL. Please use specific commands like `top suppliers`. Type `help` for options."}]}
+        
+        # Step 1: Generate SQL from natural language
+        llm = ensure_llm()
+        sql_chain = TEXT_TO_SQL_PROMPT | llm | StrOutputParser()
+        
+        print(f"DEBUG: Generating SQL for: {user_text}")
+        raw_sql = await sql_chain.ainvoke({"user_question": user_text})
+        generated_sql = clean_sql_response(raw_sql)
+        print(f"DEBUG: Generated SQL: {generated_sql}")
+        
+        # Basic validation — must look like a SELECT
+        if not generated_sql.upper().strip().startswith("SELECT"):
+            return {"messages": [{"role": "ai", "content": f"I generated an invalid query. Please try rephrasing your question.\n\nGenerated: {generated_sql}"}]}
+        
+        # Step 2: Execute the SQL
+        tool = make_sql_tool(
+            name="data_question",
+            description="Execute user's data question",
+            query=generated_sql,
+        )
+        result = await tool.ainvoke({})
+        rows = extract_rows_from_result(result)
+        
+        # Step 3: Format results
+        lines = []
+        lines.append(f"📊 **Results for:** _{user_text}_\n")
+        
+        if not rows:
+            lines.append("No results found for your query.")
+            lines.append(f"\n<details><summary>SQL executed</summary>\n\n```sql\n{generated_sql}\n```\n</details>")
+            return {"messages": [{"role": "ai", "content": "\n".join(lines)}]}
+        
+        # Determine if this is an aggregation (few rows) or a list (many rows)
+        if len(rows) <= 10:
+            # Show as a formatted summary
+            for row in rows:
+                row_parts = []
+                for key, val in row.items():
+                    # Format currency-like values
+                    if key.lower() in ("total_spend", "spend", "amount", "monthly_spend", "supplier_spend", "line_amount_usd", "q3_spend", "q1_spend", "q2_spend", "q4_spend"):
+                        try:
+                            row_parts.append(f"**{key}**: {format_currency(float(val))}")
+                        except (ValueError, TypeError):
+                            row_parts.append(f"**{key}**: {val}")
+                    else:
+                        row_parts.append(f"**{key}**: {val}")
+                lines.append(" | ".join(row_parts))
+        else:
+            # Show as a table for longer results
+            if rows:
+                # Header
+                headers = list(rows[0].keys())
+                lines.append(" | ".join(headers))
+                lines.append(" | ".join(["---"] * len(headers)))
+                # Rows (limit to 20)
+                for row in rows[:20]:
+                    vals = []
+                    for h in headers:
+                        v = row.get(h, "")
+                        # Format currency
+                        if h.lower() in ("total_spend", "spend", "amount", "monthly_spend", "supplier_spend"):
+                            try:
+                                vals.append(format_currency(float(v)))
+                            except (ValueError, TypeError):
+                                vals.append(str(v))
+                        else:
+                            vals.append(str(v))
+                    lines.append(" | ".join(vals))
+                if len(rows) > 20:
+                    lines.append(f"\n*... and {len(rows) - 20} more rows*")
+        
+        # Show the SQL for transparency
+        lines.append(f"\n<details><summary>SQL executed</summary>\n\n```sql\n{generated_sql}\n```\n</details>")
+        
+        return {"messages": [{"role": "ai", "content": "\n".join(lines)}]}
+        
+    except Exception as e:
+        tb = traceback.format_exc()
+        print("data_question_node error:", e)
+        print(tb)
+        
+        # Provide helpful error message
+        error_msg = str(e)
+        if "ORA-" in error_msg:
+            # Oracle error — likely SQL syntax issue
+            return {"messages": [{"role": "ai", "content": f"The generated SQL had an error. Try rephrasing your question.\n\nError: {error_msg}\n\nGenerated SQL:\n```sql\n{generated_sql if generated_sql else 'N/A'}\n```"}]}
+        else:
+            return {"messages": [{"role": "ai", "content": f"I had trouble answering that question.\n\nError: {e}"}]}
+
+
+# ============================================================
+# Ask Node (Intent Router → calls appropriate node)
+# ============================================================
+async def ask_node(state: MessagesState):
+    """Natural language intent understanding - routes to appropriate analysis."""
+    user_text = extract_text_from_last_message(state)
+    
+    try:
+        if not LLM_AVAILABLE:
+            return {"messages": [{"role": "ai", "content": "LLM not available. Please use specific commands like `top suppliers`, `maverick spend`, etc. Type `help` for options."}]}
+        
+        llm = ensure_llm()
+        chain = SPEND_INTENT_PROMPT | llm | StrOutputParser()
+        
+        print(f"DEBUG: Asking LLM to interpret: {user_text}")
+        raw_response = await chain.ainvoke({"user_message": user_text})
+        print(f"DEBUG: LLM response: {raw_response}")
+        
+        parsed = parse_intent_response(raw_response)
+        intent = parsed.get("intent", "help")
+        explanation = parsed.get("explanation", "")
+        
+        # Map intent to node function — now includes data_question
+        intent_map = {
+            "top_suppliers": top_suppliers_node,
+            "maverick_spend": maverick_spend_node,
+            "spend_leakage": spend_leakage_node,
+            "spend_by_category": spend_by_category_node,
+            "savings_opportunities": savings_opportunities_node,
+            "supplier_risk": supplier_risk_node,
+            "spend_trend": spend_trend_node,
+            "sample_data": sample_spend_node,
+            "data_question": data_question_node,  # Text-to-SQL fallback
+            "help": help_node,
+        }
+        
+        if intent in intent_map:
+            prefix = f"💡 *{explanation}*\n\n" if explanation else ""
+            result = await intent_map[intent](state)
+            
+            if result and "messages" in result and result["messages"]:
+                original_content = result["messages"][0].get("content", "")
+                result["messages"][0]["content"] = prefix + original_content
+            
+            return result
+        else:
+            # Unknown intent — try data_question as fallback
+            print(f"DEBUG: Unknown intent '{intent}', falling back to data_question")
+            return await data_question_node(state)
+            
+    except Exception as e:
+        tb = traceback.format_exc()
+        print("ask_node error:", e)
+        print(tb)
+        return {"messages": [{"role": "ai", "content": f"I had trouble understanding that. Try specific commands like `top suppliers` or `maverick spend`.\n\nError: {e}"}]}
